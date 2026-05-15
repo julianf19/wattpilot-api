@@ -57,12 +57,14 @@ class Wattpilot:
         cloud: bool = False,
         connect_timeout: float = 30.0,
         init_timeout: float = 30.0,
+        auto_reconnect: bool = True,
     ) -> None:
         self._host = host
         self._password = password
         self._cloud = cloud
         self._connect_timeout = connect_timeout
         self._init_timeout = init_timeout
+        self._auto_reconnect = auto_reconnect
 
         self._device = DeviceInfo(serial=serial or "")
         self._hashed_password: bytes = b""
@@ -792,13 +794,34 @@ class Wattpilot:
 
     async def _message_loop(self) -> None:
         assert self._ws is not None
+        reconnect_delay = 5.0
         try:
-            async for raw in self._ws:
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8")
-                await self._handle_message(raw)
-        except websockets.exceptions.ConnectionClosed:  # pragma: no cover
-            _LOGGER.info("WebSocket connection closed")
+            while True:
+                try:
+                    async for raw in self._ws:
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8")
+                        await self._handle_message(raw)
+                except websockets.exceptions.ConnectionClosed:
+                    _LOGGER.info("WebSocket connection closed")
+
+                self._connected = False
+                self._connected_event.clear()
+
+                if not self._auto_reconnect:
+                    break
+
+                _LOGGER.info("Reconnecting in %.0fs...", reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                try:
+                    self._all_props_initialized = False
+                    self._initialized_event.clear()
+                    self._auth_error = None
+                    self._ws = await websockets.asyncio.client.connect(self._url)
+                    reconnect_delay = 5.0
+                except Exception as exc:
+                    _LOGGER.warning("Reconnect failed: %s, retrying in %.0fs", exc, reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, 300.0)
         finally:
             self._connected = False
             self._connected_event.clear()

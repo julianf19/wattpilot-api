@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import json
 from types import SimpleNamespace
@@ -605,6 +606,7 @@ class TestWattpilotConnectionClosed:
             serial=SAMPLE_SERIAL,
             connect_timeout=5.0,
             init_timeout=5.0,
+            auto_reconnect=False,
         )
         wp._url = f"ws://127.0.0.1:{mock_server.port}/ws"
         await wp.connect()
@@ -615,6 +617,112 @@ class TestWattpilotConnectionClosed:
             await ws.close()
         await asyncio.sleep(0.2)
         assert wp.connected is False
+
+    async def test_connection_closed_exception_branch(self) -> None:
+        """Cover the ConnectionClosed handler — raised on abrupt TCP drop."""
+        wp = Wattpilot("host", "pw", auto_reconnect=False)
+
+        class AbruptWS:
+            def __aiter__(self) -> "AbruptWS":
+                return self
+
+            async def __anext__(self) -> bytes:
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+
+            async def close(self) -> None:
+                pass
+
+        wp._ws = AbruptWS()  # type: ignore[assignment]
+        task = asyncio.create_task(wp._message_loop())
+        await asyncio.sleep(0.1)
+        assert wp.connected is False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_auto_reconnect_after_drop(self, mock_server: MockWattpilotServer) -> None:
+        """Client reconnects automatically after server closes connection."""
+        wp = Wattpilot(
+            SAMPLE_HOST,
+            SAMPLE_PASSWORD,
+            serial=SAMPLE_SERIAL,
+            connect_timeout=5.0,
+            init_timeout=5.0,
+            auto_reconnect=True,
+        )
+        wp._url = f"ws://127.0.0.1:{mock_server.port}/ws"
+
+        real_sleep = asyncio.sleep
+
+        async def instant_sleep(_delay: float) -> None:
+            await real_sleep(0)
+
+        asyncio.sleep = instant_sleep  # type: ignore[assignment]
+        try:
+            await wp.connect()
+            assert wp.connected is True
+
+            for ws in list(mock_server._connections):
+                await ws.close()
+
+            for _ in range(30):
+                await real_sleep(0.05)
+                if wp.connected:
+                    break
+
+            assert wp.connected is True
+        finally:
+            asyncio.sleep = real_sleep  # type: ignore[assignment]
+            await wp.disconnect()
+
+    async def test_reconnect_delay_backoff(self) -> None:
+        """Reconnect delay doubles when the server is unreachable."""
+        async def one_shot_handler(ws: Any) -> None:
+            await ws.send(json.dumps(SAMPLE_HELLO))
+            await ws.send(json.dumps(SAMPLE_AUTH_REQUIRED))
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg["type"] == "auth":
+                    await ws.send(json.dumps(SAMPLE_AUTH_SUCCESS))
+                    await ws.send(json.dumps(SAMPLE_FULL_STATUS))
+
+        server = await websockets.asyncio.server.serve(one_shot_handler, "127.0.0.1", 0)
+        port = next(s.getsockname()[1] for s in server.sockets)
+
+        wp = Wattpilot(
+            SAMPLE_HOST,
+            SAMPLE_PASSWORD,
+            serial=SAMPLE_SERIAL,
+            connect_timeout=5.0,
+            init_timeout=5.0,
+            auto_reconnect=True,
+        )
+        wp._url = f"ws://127.0.0.1:{port}/ws"
+        await wp.connect()
+
+        delays: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def capture_sleep(delay: float) -> None:
+            delays.append(delay)
+            await real_sleep(0)
+
+        asyncio.sleep = capture_sleep  # type: ignore[assignment]
+        try:
+            server.close()
+            await server.wait_closed()
+
+            for _ in range(50):
+                await real_sleep(0.05)
+                if len(delays) >= 2:
+                    break
+
+            reconnect_delays = [d for d in delays if d > 0]
+            assert reconnect_delays[0] == 5.0
+            assert reconnect_delays[1] == 10.0
+        finally:
+            asyncio.sleep = real_sleep  # type: ignore[assignment]
+            await wp.disconnect()
 
 
 # ---- Issue #5: Additional typed properties ----
